@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 import cv2
 import numpy as np
+from scipy.ndimage import uniform_filter1d
 import fitz  # PyMuPDF - much faster than pdf2image
 from PIL import Image
 import img2pdf
@@ -598,16 +599,114 @@ class PDFPreprocessor:
     
     def split_corrected_page(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        STEP 3: Split the corrected rectangle in half vertically.
+        STEP 3: Split the corrected rectangle in half vertically at the spine/gutter.
+        Finds the spine pattern: white gutter → dark spine → white gutter.
+        In histogram: high values (white) → low values (dark spine) → high values (white).
         Returns (left_page, right_page).
         """
         height, width = image.shape
-        mid_x = width // 2
+        center_x = width // 2
         
-        left_page = image[:, :mid_x]
-        right_page = image[:, mid_x:]
+        # Search for spine in middle 40% of image (30%-70% of width)
+        search_start = int(width * 0.3)
+        search_end = int(width * 0.7)
+        search_region = image[:, search_start:search_end]
         
-        logger.info(f"      Split at x={mid_x}: left={left_page.shape[1]}x{left_page.shape[0]}, right={right_page.shape[1]}x{right_page.shape[0]}")
+        # Compute vertical histogram: sum of pixel intensities along each column
+        # High values = white (gutter), low values = dark (spine or text)
+        vertical_hist = np.sum(search_region, axis=0).astype(float)
+        
+        # Normalize histogram to 0-1 range for easier threshold calculation
+        hist_min = np.min(vertical_hist)
+        hist_max = np.max(vertical_hist)
+        if hist_max > hist_min:
+            vertical_hist_norm = (vertical_hist - hist_min) / (hist_max - hist_min)
+        else:
+            vertical_hist_norm = vertical_hist
+        
+        logger.info(f"      Searching for spine pattern (x={search_start}-{search_end})")
+        
+        # Smooth histogram to reduce noise
+        smoothed_hist = uniform_filter1d(vertical_hist_norm, size=10)
+        
+        # Find valleys (low points) in the histogram - these are dark regions (spine or text columns)
+        # But we want the valley that's surrounded by high values (white gutters)
+        
+        # Define threshold: values below 0.5 are considered "dark" (spine candidate)
+        # values above 0.7 are considered "white" (gutter)
+        dark_threshold = 0.5
+        white_threshold = 0.7
+        
+        # Find dark regions (potential spine)
+        dark_mask = smoothed_hist < dark_threshold
+        
+        # Find contiguous dark regions
+        dark_regions = []
+        in_dark = False
+        start_idx = 0
+        
+        for i, is_dark in enumerate(dark_mask):
+            if is_dark and not in_dark:
+                start_idx = i
+                in_dark = True
+            elif not is_dark and in_dark:
+                dark_regions.append((start_idx, i))
+                in_dark = False
+        if in_dark:
+            dark_regions.append((start_idx, len(dark_mask)))
+        
+        logger.info(f"      Found {len(dark_regions)} dark regions")
+        
+        # Score each dark region based on:
+        # 1. How much white (high values) surround it on both sides
+        # 2. How close it is to center
+        best_score = -1
+        best_region = None
+        
+        for start, end in dark_regions:
+            region_center = (start + end) // 2
+            region_center_abs = search_start + region_center
+            
+            # Check whiteness on left side (20 pixels before)
+            left_check_start = max(0, start - 20)
+            left_check_end = start
+            left_whiteness = np.mean(smoothed_hist[left_check_start:left_check_end]) if left_check_end > left_check_start else 0
+            
+            # Check whiteness on right side (20 pixels after)
+            right_check_start = end
+            right_check_end = min(len(smoothed_hist), end + 20)
+            right_whiteness = np.mean(smoothed_hist[right_check_start:right_check_end]) if right_check_end > right_check_start else 0
+            
+            # Both sides should be white (gutter)
+            whiteness_score = min(left_whiteness, right_whiteness)
+            
+            # Distance from center (closer is better)
+            distance_from_center = abs(region_center_abs - center_x)
+            distance_score = 1.0 / (1.0 + distance_from_center / 100.0)
+            
+            # Combined score
+            score = whiteness_score * 0.7 + distance_score * 0.3
+            
+            logger.info(f"        Region {start}-{end} (x={search_start + start}-{search_start + end}): whiteness={whiteness_score:.2f}, distance={distance_from_center}px, score={score:.2f}")
+            
+            if score > best_score:
+                best_score = score
+                best_region = (start, end)
+        
+        if best_region is not None:
+            start, end = best_region
+            spine_x = search_start + (start + end) // 2
+            logger.info(f"      Selected spine region: x={search_start + start}-{search_start + end}, cutting at x={spine_x}")
+        else:
+            # Fallback: use center
+            spine_x = center_x
+            logger.info(f"      No spine pattern found, using center: x={spine_x}")
+        
+        # Split at the detected spine
+        left_page = image[:, :spine_x]
+        right_page = image[:, spine_x:]
+        
+        logger.info(f"      Split: left={left_page.shape[1]}x{left_page.shape[0]}, right={right_page.shape[1]}x{right_page.shape[0]}")
         
         return left_page, right_page
     
