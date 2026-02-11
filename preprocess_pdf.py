@@ -28,16 +28,18 @@ logger = logging.getLogger(__name__)
 class PDFPreprocessor:
     """Handles preprocessing of double-page book scans for OCR"""
     
-    def __init__(self, input_folder: str, output_folder: str, save_intermediate: bool = True):
+    def __init__(self, input_folder: str, output_folder: str, save_intermediate: bool = True, left_margin_crop: int = 100):
         self.input_folder = Path(input_folder)
         self.output_folder = Path(output_folder)
         self.save_intermediate = save_intermediate
+        self.left_margin_crop = left_margin_crop
         self.intermediate_folder = Path(output_folder).parent / "intermediate"
         
         logger.info(f"Initializing PDF Preprocessor")
         logger.info(f"  Input folder: {self.input_folder}")
         logger.info(f"  Output folder: {self.output_folder}")
         logger.info(f"  Save intermediate images: {self.save_intermediate}")
+        logger.info(f"  Left margin crop: {self.left_margin_crop}px")
         
         if self.save_intermediate:
             self.intermediate_folder.mkdir(parents=True, exist_ok=True)
@@ -206,7 +208,9 @@ class PDFPreprocessor:
         logger.info(f"  PHASE 3: Applying average trapezoid to all pages")
         logger.info(f"  ========================================")
         
+        all_pages = []  # Collect all processed pages
         page_number = 1
+        
         for idx, gray in enumerate(gray_images):
             logger.info(f"\n  Processing scan page {idx + 1}/{len(gray_images)}")
             logger.info(f"    Image size: {gray.shape[1]}x{gray.shape[0]} pixels")
@@ -232,7 +236,7 @@ class PDFPreprocessor:
             logger.info(f"    Step 2: Splitting corrected page in half...")
             left_page, right_page = self.split_corrected_page(corrected_page)
             
-            # STEP 3: Save each half as a separate PDF
+            # STEP 3: Collect pages for final PDF
             for side_idx, page_img in enumerate([left_page, right_page]):
                 side_name = "left" if side_idx == 0 else "right"
                 logger.info(f"    Processing {side_name} page (output page {page_number})...")
@@ -244,15 +248,23 @@ class PDFPreprocessor:
                     cv2.imwrite(str(snapshot_path), page_img)
                     logger.info(f"      Saved intermediate: {snapshot_path.name}")
                 
-                # Save as single-page PDF
-                output_filename = f"{pdf_path.stem}_page_{page_number:04d}.pdf"
-                output_path = output_dir / output_filename
-                logger.info(f"      Saving as: {output_filename}")
-                self.save_as_pdf(page_img, output_path)
+                # Crop left margin
+                if self.left_margin_crop > 0 and page_img.shape[1] > self.left_margin_crop:
+                    page_img = page_img[:, self.left_margin_crop:]
+                    logger.info(f"      Cropped {self.left_margin_crop}px from left edge -> {page_img.shape[1]}x{page_img.shape[0]} pixels")
                 
+                # Add to collection
+                all_pages.append(page_img)
                 page_number += 1
         
-        logger.info(f"\n  ✓ Completed: {pdf_path.name} -> {page_number - 1} pages generated")
+        # Save all pages as a single PDF
+        logger.info(f"\n  ========================================")
+        logger.info(f"  Saving {len(all_pages)} pages as single PDF...")
+        output_filename = f"{pdf_path.stem}_processed.pdf"
+        output_path = output_dir / output_filename
+        self.save_multi_page_pdf(all_pages, output_path)
+        
+        logger.info(f"\n  ✓ Completed: {pdf_path.name} -> {len(all_pages)} pages saved to {output_filename}")
         logger.info("="*60)
     
     def detect_page_trapezoid_simple(self, gray_image: np.ndarray, debug_dir: Optional[Path] = None, scan_num: int = 0) -> Optional[np.ndarray]:
@@ -751,6 +763,27 @@ class PDFPreprocessor:
         
         file_size_kb = output_path.stat().st_size / 1024
         logger.info(f"        ✓ Saved: {output_path.name} ({file_size_kb:.1f} KB)")
+    
+    def save_multi_page_pdf(self, images: List[np.ndarray], output_path: Path):
+        """Save multiple images as a single multi-page PDF"""
+        from io import BytesIO
+        
+        # Convert all images to bytes with JPEG compression
+        image_bytes_list = []
+        for i, image in enumerate(images):
+            pil_image = Image.fromarray(image)
+            img_bytes = BytesIO()
+            # Use JPEG with 85% quality for good compression
+            pil_image.save(img_bytes, format='JPEG', quality=85, optimize=True)
+            image_bytes_list.append(img_bytes.getvalue())
+        
+        # Convert all images to a single multi-page PDF
+        with open(output_path, 'wb') as f:
+            pdf_bytes = img2pdf.convert(image_bytes_list)
+            f.write(pdf_bytes)
+        
+        file_size_mb = output_path.stat().st_size / (1024 * 1024)
+        logger.info(f"  ✓ Saved: {output_path.name} ({file_size_mb:.2f} MB, {len(images)} pages)")
 
 
 def main():
