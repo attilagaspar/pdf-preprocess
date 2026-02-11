@@ -28,11 +28,12 @@ logger = logging.getLogger(__name__)
 class PDFPreprocessor:
     """Handles preprocessing of double-page book scans for OCR"""
     
-    def __init__(self, input_folder: str, output_folder: str, save_intermediate: bool = True, left_margin_crop: int = 100):
+    def __init__(self, input_folder: str, output_folder: str, save_intermediate: bool = True, left_margin_crop: int = 100, window_size: int = 10):
         self.input_folder = Path(input_folder)
         self.output_folder = Path(output_folder)
         self.save_intermediate = save_intermediate
         self.left_margin_crop = left_margin_crop
+        self.window_size = window_size
         self.intermediate_folder = Path(output_folder).parent / "intermediate"
         
         logger.info(f"Initializing PDF Preprocessor")
@@ -40,6 +41,7 @@ class PDFPreprocessor:
         logger.info(f"  Output folder: {self.output_folder}")
         logger.info(f"  Save intermediate images: {self.save_intermediate}")
         logger.info(f"  Left margin crop: {self.left_margin_crop}px")
+        logger.info(f"  Trapezoid window size: {self.window_size} pages")
         
         if self.save_intermediate:
             self.intermediate_folder.mkdir(parents=True, exist_ok=True)
@@ -64,10 +66,9 @@ class PDFPreprocessor:
                 logger.error(f"Error processing {pdf_path}: {str(e)}", exc_info=True)
     
     def process_single_pdf(self, pdf_path: Path):
-        """Process a single PDF file using three-phase approach:
-        Phase 1: Detect trapezoids on all pages
-        Phase 2: Compute average trapezoid from non-edge-touching pages
-        Phase 3: Apply average trapezoid to all pages
+        """Process a single PDF file using sliding window approach for trapezoid detection.
+        Initial window: Load first window_size pages, detect trapezoids, compute average.
+        Then for each subsequent page: load, detect, update window, recompute average, process.
         """
         logger.info(f"Processing: {pdf_path}")
         
@@ -78,6 +79,7 @@ class PDFPreprocessor:
         logger.info(f"  Output directory: {output_dir}")
         
         # Create intermediate subfolder for this PDF if enabled
+        intermediate_pdf_dir = None
         if self.save_intermediate:
             intermediate_pdf_dir = self.intermediate_folder / rel_path.parent / pdf_path.stem
             intermediate_pdf_dir.mkdir(parents=True, exist_ok=True)
@@ -87,175 +89,138 @@ class PDFPreprocessor:
         file_size_mb = pdf_path.stat().st_size / (1024 * 1024)
         logger.info(f"  PDF file size: {file_size_mb:.2f} MB")
         
-        # Convert PDF to images using PyMuPDF (much faster than pdf2image)
-        logger.info(f"  Opening PDF and converting pages to images...")
-        
         try:
             start_time = time.time()
             
-            # Open PDF with PyMuPDF
+            # Open PDF with PyMuPDF (keep it open for streaming)
             pdf_document = fitz.open(str(pdf_path))
             page_count = pdf_document.page_count
             logger.info(f"  PDF has {page_count} page(s)")
+            logger.info(f"  Using sliding window processing with window size: {self.window_size}")
             
-            # Convert each page to image and grayscale
-            images = []
-            gray_images = []
-            for page_num in range(page_count):
-                logger.info(f"  Loading page {page_num + 1}/{page_count}...")
-                page = pdf_document[page_num]
+            all_pages = []  # Collect all processed pages
+            page_number = 1
+            edge_margin = 50  # pixels
+            
+            # Sliding window for valid trapezoids
+            valid_trapezoids_window = []  # List of trapezoid contours
+            
+            # ==============================================
+            # INITIAL WINDOW: Process first window_size pages
+            # ==============================================
+            initial_window_size = min(self.window_size, page_count)
+            logger.info(f"\n  ========================================")
+            logger.info(f"  INITIAL WINDOW: Loading first {initial_window_size} pages")
+            logger.info(f"  ========================================")
+            
+            for page_idx in range(initial_window_size):
+                gray = self._load_page_as_gray(pdf_document, page_idx, page_count, intermediate_pdf_dir)
                 
-                # Render page to image at 300 DPI (zoom factor 300/72 = 4.167)
-                zoom = 300 / 72  # 300 DPI
-                mat = fitz.Matrix(zoom, zoom)
-                pix = page.get_pixmap(matrix=mat)
+                # Detect trapezoid
+                trapezoid = self.detect_page_trapezoid_simple(gray, intermediate_pdf_dir, page_idx + 1)
                 
-                # Convert to PIL Image
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                images.append(img)
+                if trapezoid is not None:
+                    # Check if trapezoid touches image edges
+                    touches_edge = self.touches_image_edge(trapezoid, gray.shape, edge_margin)
+                    
+                    status = "⚠ TOUCHES EDGE (excluded)" if touches_edge else "✓ Valid (included)"
+                    logger.info(f"    {status}")
+                    corners = trapezoid.reshape(-1, 2)
+                    logger.info(f"    Corners: {corners.tolist()}")
+                    
+                    # Save contour detection snapshot
+                    if self.save_intermediate:
+                        debug_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+                        color = (0, 0, 255) if touches_edge else (0, 255, 0)
+                        cv2.drawContours(debug_img, [trapezoid], -1, color, 5)
+                        snapshot_path = intermediate_pdf_dir / f"scan_{page_idx + 1:03d}_02_detected_trapezoid.png"
+                        cv2.imwrite(str(snapshot_path), debug_img)
+                        logger.info(f"    Saved: {snapshot_path.name}")
+                    
+                    # Add to window if valid
+                    if not touches_edge:
+                        valid_trapezoids_window.append(trapezoid)
+            
+            # Compute initial average trapezoid
+            if len(valid_trapezoids_window) == 0:
+                logger.error(f"  ✗ No valid trapezoids found in initial window! Cannot proceed.")
+                pdf_document.close()
+                return
+            
+            average_trapezoid = self.compute_average_trapezoid(valid_trapezoids_window)
+            logger.info(f"\n  Initial window average computed from {len(valid_trapezoids_window)} valid trapezoids")
+            avg_corners = average_trapezoid.reshape(-1, 2)
+            logger.info(f"  Corners: {avg_corners.tolist()}")
+            
+            # Process initial window pages
+            logger.info(f"\n  ========================================")
+            logger.info(f"  Processing initial {initial_window_size} pages")
+            logger.info(f"  ========================================")
+            
+            for page_idx in range(initial_window_size):
+                gray = self._load_page_as_gray(pdf_document, page_idx, page_count, intermediate_pdf_dir, reload=True)
+                processed = self._process_and_collect_page(gray, average_trapezoid, page_idx, page_number, intermediate_pdf_dir)
+                if processed:
+                    all_pages.extend(processed)
+                    page_number += len(processed)
+            
+            # ==============================================
+            # STREAMING: Process remaining pages with sliding window
+            # ==============================================
+            if page_count > initial_window_size:
+                logger.info(f"\n  ========================================")
+                logger.info(f"  STREAMING: Processing remaining {page_count - initial_window_size} pages")
+                logger.info(f"  ========================================")
                 
-                # Convert to grayscale for processing
-                cv_image = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-                gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-                gray_images.append(gray)
+                for page_idx in range(initial_window_size, page_count):
+                    # Load next page
+                    gray = self._load_page_as_gray(pdf_document, page_idx, page_count, intermediate_pdf_dir)
+                    
+                    # Detect trapezoid on new page
+                    trapezoid = self.detect_page_trapezoid_simple(gray, intermediate_pdf_dir, page_idx + 1)
+                    
+                    if trapezoid is not None:
+                        touches_edge = self.touches_image_edge(trapezoid, gray.shape, edge_margin)
+                        
+                        status = "⚠ TOUCHES EDGE (excluded)" if touches_edge else "✓ Valid (included)"
+                        logger.info(f"    {status}")
+                        corners = trapezoid.reshape(-1, 2)
+                        logger.info(f"    Corners: {corners.tolist()}")
+                        
+                        # Save contour detection snapshot
+                        if self.save_intermediate:
+                            debug_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+                            color = (0, 0, 255) if touches_edge else (0, 255, 0)
+                            cv2.drawContours(debug_img, [trapezoid], -1, color, 5)
+                            snapshot_path = intermediate_pdf_dir / f"scan_{page_idx + 1:03d}_02_detected_trapezoid.png"
+                            cv2.imwrite(str(snapshot_path), debug_img)
+                            logger.info(f"    Saved: {snapshot_path.name}")
+                        
+                        # Update sliding window if valid
+                        if not touches_edge:
+                            valid_trapezoids_window.append(trapezoid)
+                            # Remove oldest if window exceeds size
+                            if len(valid_trapezoids_window) > self.window_size:
+                                valid_trapezoids_window.pop(0)
+                            
+                            # Recompute average with updated window
+                            average_trapezoid = self.compute_average_trapezoid(valid_trapezoids_window)
+                            logger.info(f"    Updated window: {len(valid_trapezoids_window)} valid trapezoids")
+                    
+                    # Process this page with current average trapezoid
+                    processed = self._process_and_collect_page(gray, average_trapezoid, page_idx, page_number, intermediate_pdf_dir)
+                    if processed:
+                        all_pages.extend(processed)
+                        page_number += len(processed)
             
             pdf_document.close()
             
             elapsed_time = time.time() - start_time
-            logger.info(f"  ✓ Conversion complete in {elapsed_time:.1f} seconds")
-            logger.info(f"  Converted to {len(images)} page(s)")
+            logger.info(f"\n  Processing completed in {elapsed_time:.1f} seconds")
+            
         except Exception as e:
-            logger.error(f"  Failed to convert PDF: {str(e)}")
-            logger.error(f"  Make sure PyMuPDF is installed: pip install PyMuPDF")
+            logger.error(f"  Failed to process PDF: {str(e)}")
             raise
-        
-        # ==============================================
-        # PHASE 1: Detect trapezoids on all pages
-        # ==============================================
-        logger.info(f"\n  ========================================")
-        logger.info(f"  PHASE 1: Detecting trapezoids on all pages")
-        logger.info(f"  ========================================")
-        
-        trapezoids = []
-        edge_margin = 50  # pixels
-        
-        for idx, gray in enumerate(gray_images):
-            logger.info(f"\n  Page {idx + 1}/{len(gray_images)}: Detecting trapezoid...")
-            
-            # Save grayscale snapshot
-            if self.save_intermediate:
-                snapshot_path = intermediate_pdf_dir / f"scan_{idx + 1:03d}_01_grayscale.png"
-                cv2.imwrite(str(snapshot_path), gray)
-                logger.info(f"    Saved: {snapshot_path.name}")
-            
-            # Detect trapezoid
-            trapezoid = self.detect_page_trapezoid_simple(gray, intermediate_pdf_dir if self.save_intermediate else None, idx + 1)
-            
-            if trapezoid is None:
-                logger.warning(f"    ⚠ Could not detect trapezoid")
-                trapezoids.append(None)
-                continue
-            
-            # Check if trapezoid touches image edges
-            touches_edge = self.touches_image_edge(trapezoid, gray.shape, edge_margin)
-            
-            trapezoids.append({
-                'contour': trapezoid,
-                'touches_edge': touches_edge,
-                'page_idx': idx
-            })
-            
-            status = "⚠ TOUCHES EDGE (excluded)" if touches_edge else "✓ Valid (included)"
-            logger.info(f"    {status}")
-            corners = trapezoid.reshape(-1, 2)
-            logger.info(f"    Corners: {corners.tolist()}")
-            
-            # Save contour detection snapshot
-            if self.save_intermediate:
-                debug_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                color = (0, 0, 255) if touches_edge else (0, 255, 0)  # Red if edge-touching, green if valid
-                cv2.drawContours(debug_img, [trapezoid], -1, color, 5)
-                snapshot_path = intermediate_pdf_dir / f"scan_{idx + 1:03d}_02_detected_trapezoid.png"
-                cv2.imwrite(str(snapshot_path), debug_img)
-                logger.info(f"    Saved: {snapshot_path.name}")
-        
-        # ==============================================
-        # PHASE 2: Compute average trapezoid
-        # ==============================================
-        logger.info(f"\n  ========================================")
-        logger.info(f"  PHASE 2: Computing average trapezoid")
-        logger.info(f"  ========================================")
-        
-        valid_trapezoids = [t['contour'] for t in trapezoids if t is not None and not t['touches_edge']]
-        
-        logger.info(f"  Valid trapezoids (non-edge-touching): {len(valid_trapezoids)}/{len(trapezoids)}")
-        
-        if len(valid_trapezoids) == 0:
-            logger.error(f"  ✗ No valid trapezoids found! Cannot proceed.")
-            logger.error(f"  All detected trapezoids touch the image edges.")
-            return
-        
-        average_trapezoid = self.compute_average_trapezoid(valid_trapezoids)
-        
-        logger.info(f"  ✓ Average trapezoid computed:")
-        avg_corners = average_trapezoid.reshape(-1, 2)
-        logger.info(f"    Corners: {avg_corners.tolist()}")
-        
-        # ==============================================
-        # PHASE 3: Apply average trapezoid to all pages
-        # ==============================================
-        logger.info(f"\n  ========================================")
-        logger.info(f"  PHASE 3: Applying average trapezoid to all pages")
-        logger.info(f"  ========================================")
-        
-        all_pages = []  # Collect all processed pages
-        page_number = 1
-        
-        for idx, gray in enumerate(gray_images):
-            logger.info(f"\n  Processing scan page {idx + 1}/{len(gray_images)}")
-            logger.info(f"    Image size: {gray.shape[1]}x{gray.shape[0]} pixels")
-            logger.info(f"    Using average trapezoid for perspective correction")
-            
-            # STEP 1: Apply perspective correction using average trapezoid
-            logger.info(f"    Step 1: Applying perspective correction...")
-            corrected_page = self.apply_perspective_correction_to_full_page(gray, average_trapezoid)
-            
-            if corrected_page is None:
-                logger.warning(f"    ⚠ Perspective correction failed, skipping this scan")
-                continue
-            
-            logger.info(f"      ✓ Corrected dimensions: {corrected_page.shape[1]}x{corrected_page.shape[0]} pixels")
-            
-            # Save perspective corrected snapshot
-            if self.save_intermediate:
-                snapshot_path = intermediate_pdf_dir / f"scan_{idx + 1:03d}_03_perspective_corrected.png"
-                cv2.imwrite(str(snapshot_path), corrected_page)
-                logger.info(f"      Saved intermediate: {snapshot_path.name}")
-            
-            # STEP 2: Cut the corrected page in half (middle split)
-            logger.info(f"    Step 2: Splitting corrected page in half...")
-            left_page, right_page = self.split_corrected_page(corrected_page)
-            
-            # STEP 3: Collect pages for final PDF
-            for side_idx, page_img in enumerate([left_page, right_page]):
-                side_name = "left" if side_idx == 0 else "right"
-                logger.info(f"    Processing {side_name} page (output page {page_number})...")
-                logger.info(f"      Page dimensions: {page_img.shape[1]}x{page_img.shape[0]} pixels")
-                
-                # Save split page snapshot
-                if self.save_intermediate:
-                    snapshot_path = intermediate_pdf_dir / f"scan_{idx + 1:03d}_04_split_{side_name}.png"
-                    cv2.imwrite(str(snapshot_path), page_img)
-                    logger.info(f"      Saved intermediate: {snapshot_path.name}")
-                
-                # Crop left margin
-                if self.left_margin_crop > 0 and page_img.shape[1] > self.left_margin_crop:
-                    page_img = page_img[:, self.left_margin_crop:]
-                    logger.info(f"      Cropped {self.left_margin_crop}px from left edge -> {page_img.shape[1]}x{page_img.shape[0]} pixels")
-                
-                # Add to collection
-                all_pages.append(page_img)
-                page_number += 1
         
         # Save all pages as a single PDF
         logger.info(f"\n  ========================================")
@@ -266,6 +231,81 @@ class PDFPreprocessor:
         
         logger.info(f"\n  ✓ Completed: {pdf_path.name} -> {len(all_pages)} pages saved to {output_filename}")
         logger.info("="*60)
+    
+    def _load_page_as_gray(self, pdf_document, page_idx: int, page_count: int, intermediate_dir: Optional[Path], reload: bool = False) -> np.ndarray:
+        """Load a single page from PDF and convert to grayscale."""
+        if not reload:
+            logger.info(f"\n  Page {page_idx + 1}/{page_count}: Loading and detecting trapezoid...")
+        
+        page = pdf_document[page_idx]
+        
+        # Render page to image at 300 DPI
+        zoom = 300 / 72
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat)
+        
+        # Convert to grayscale
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        cv_image = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+        
+        # Save grayscale snapshot
+        if intermediate_dir is not None and not reload:
+            snapshot_path = intermediate_dir / f"scan_{page_idx + 1:03d}_01_grayscale.png"
+            cv2.imwrite(str(snapshot_path), gray)
+            logger.info(f"    Saved: {snapshot_path.name}")
+        
+        return gray
+    
+    def _process_and_collect_page(self, gray: np.ndarray, average_trapezoid: np.ndarray, page_idx: int, start_page_number: int, intermediate_dir: Optional[Path]) -> List[np.ndarray]:
+        """Apply perspective correction, split, and return processed pages."""
+        logger.info(f"\n  Processing scan page {page_idx + 1}")
+        logger.info(f"    Image size: {gray.shape[1]}x{gray.shape[0]} pixels")
+        
+        # STEP 1: Apply perspective correction
+        logger.info(f"    Step 1: Applying perspective correction...")
+        corrected_page = self.apply_perspective_correction_to_full_page(gray, average_trapezoid)
+        
+        if corrected_page is None:
+            logger.warning(f"    ⚠ Perspective correction failed, skipping this scan")
+            return []
+        
+        logger.info(f"      ✓ Corrected dimensions: {corrected_page.shape[1]}x{corrected_page.shape[0]} pixels")
+        
+        # Save perspective corrected snapshot
+        if intermediate_dir is not None:
+            snapshot_path = intermediate_dir / f"scan_{page_idx + 1:03d}_03_perspective_corrected.png"
+            cv2.imwrite(str(snapshot_path), corrected_page)
+            logger.info(f"      Saved intermediate: {snapshot_path.name}")
+        
+        # STEP 2: Split page in half
+        logger.info(f"    Step 2: Splitting corrected page in half...")
+        left_page, right_page = self.split_corrected_page(corrected_page)
+        
+        # STEP 3: Process and collect both halves
+        processed_pages = []
+        page_number = start_page_number
+        
+        for side_idx, page_img in enumerate([left_page, right_page]):
+            side_name = "left" if side_idx == 0 else "right"
+            logger.info(f"    Processing {side_name} page (output page {page_number})...")
+            logger.info(f"      Page dimensions: {page_img.shape[1]}x{page_img.shape[0]} pixels")
+            
+            # Save split page snapshot
+            if intermediate_dir is not None:
+                snapshot_path = intermediate_dir / f"scan_{page_idx + 1:03d}_04_split_{side_name}.png"
+                cv2.imwrite(str(snapshot_path), page_img)
+                logger.info(f"      Saved intermediate: {snapshot_path.name}")
+            
+            # Crop left margin
+            if self.left_margin_crop > 0 and page_img.shape[1] > self.left_margin_crop:
+                page_img = page_img[:, self.left_margin_crop:]
+                logger.info(f"      Cropped {self.left_margin_crop}px from left edge -> {page_img.shape[1]}x{page_img.shape[0]} pixels")
+            
+            processed_pages.append(page_img)
+            page_number += 1
+        
+        return processed_pages
     
     def detect_page_trapezoid_simple(self, gray_image: np.ndarray, debug_dir: Optional[Path] = None, scan_num: int = 0) -> Optional[np.ndarray]:
         """Simple trapezoid detection using morphological operations + contour approximation.
