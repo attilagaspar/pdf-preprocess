@@ -137,7 +137,7 @@ class PDFPreprocessor:
             
             # STEP 1: Detect the rectangular/trapezoid page shape in the dark background
             logger.info(f"    Step 1: Detecting page contour...")
-            page_contour = self.detect_page_contour(gray)
+            page_contour = self.detect_page_contour(gray, intermediate_pdf_dir if self.save_intermediate else None, idx + 1)
             
             if page_contour is None:
                 logger.warning(f"    ⚠ Could not detect page contour, skipping this scan")
@@ -194,24 +194,41 @@ class PDFPreprocessor:
         logger.info(f"\n  ✓ Completed: {pdf_path.name} -> {page_number - 1} pages generated")
         logger.info("="*60)
     
-    def detect_page_contour(self, gray_image: np.ndarray) -> Optional[np.ndarray]:
+    def detect_page_contour(self, gray_image: np.ndarray, debug_dir: Optional[Path] = None, scan_num: int = 0) -> Optional[np.ndarray]:
         """
         STEP 1: Detect the rectangular/trapezoid page shape in the mostly black background.
+        Robust against fingers or other small objects in corners.
         Returns the contour of the page with 4 corner points.
         """
         height, width = gray_image.shape
         logger.info(f"      Analyzing image for page detection ({width}x{height})...")
         
-        # Apply binary threshold - invert so page (light) becomes white, background (dark) becomes black
-        # Using Otsu's method for automatic threshold
+        # Apply binary threshold - page (light) becomes white, background (dark) becomes black
         _, binary = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         logger.info(f"      Applied binary threshold (Otsu)")
         
-        # Morphological operations to clean up noise and connect page edges
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-        morph = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        morph = cv2.morphologyEx(morph, cv2.MORPH_OPEN, kernel)
-        logger.info(f"      Applied morphological operations")
+        # Morphological OPENING first to remove small objects (fingers, noise)
+        # Opening = erosion followed by dilation - removes small white objects
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 10))
+        morph = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_small, iterations=2)
+        logger.info(f"      Applied opening to remove small objects (fingers)")
+        
+        # Save after opening (shows fingers removed)
+        if debug_dir is not None:
+            snapshot_path = debug_dir / f"scan_{scan_num:03d}_01b_after_opening.png"
+            cv2.imwrite(str(snapshot_path), morph)
+            logger.info(f"      Saved intermediate: {snapshot_path.name}")
+        
+        # Now CLOSING to connect page edges and fill small holes
+        kernel_large = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 20))
+        morph = cv2.morphologyEx(morph, cv2.MORPH_CLOSE, kernel_large, iterations=2)
+        logger.info(f"      Applied closing to connect page edges")
+        
+        # Save after closing (shows final cleaned mask)
+        if debug_dir is not None:
+            snapshot_path = debug_dir / f"scan_{scan_num:03d}_01c_after_closing.png"
+            cv2.imwrite(str(snapshot_path), morph)
+            logger.info(f"      Saved intermediate: {snapshot_path.name}")
         
         # Find contours
         contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -221,16 +238,35 @@ class PDFPreprocessor:
             logger.warning("      ⚠ No contours found")
             return None
         
-        # Find the largest contour (should be the page)
-        largest_contour = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(largest_contour)
-        area_percent = (area / (width * height)) * 100
-        logger.info(f"      Largest contour: {area:.0f} pixels ({area_percent:.1f}% of image)")
+        # Filter contours by size and aspect ratio
+        valid_contours = []
+        total_area = width * height
         
-        # The page should be a significant portion of the image (at least 20%)
-        if area_percent < 20:
-            logger.warning(f"      ⚠ Contour too small (expected >20% of image)")
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            area_percent = (area / total_area) * 100
+            
+            # Must be at least 30% of image (page is the dominant object)
+            if area_percent < 30:
+                continue
+            
+            # Check aspect ratio (book pages are typically portrait or landscape)
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = float(w) / h if h > 0 else 0
+            
+            # Accept aspect ratios between 0.3 and 3.0 (very permissive)
+            if 0.3 < aspect_ratio < 3.0:
+                valid_contours.append((contour, area, area_percent))
+                logger.info(f"      Valid contour: {area:.0f} pixels ({area_percent:.1f}%), aspect ratio: {aspect_ratio:.2f}")
+        
+        if len(valid_contours) == 0:
+            logger.warning("      ⚠ No valid contours found")
             return None
+        
+        # Take the largest valid contour
+        valid_contours.sort(key=lambda x: x[1], reverse=True)
+        largest_contour, area, area_percent = valid_contours[0]
+        logger.info(f"      Selected contour: {area:.0f} pixels ({area_percent:.1f}% of image)")
         
         # Approximate the contour to a polygon
         epsilon = 0.02 * cv2.arcLength(largest_contour, True)
@@ -240,7 +276,7 @@ class PDFPreprocessor:
         
         # If we don't have exactly 4 points, try with different epsilon values
         if len(approx) != 4:
-            for eps_multiplier in [0.01, 0.03, 0.04, 0.05]:
+            for eps_multiplier in [0.01, 0.015, 0.025, 0.03, 0.04, 0.05]:
                 epsilon = eps_multiplier * cv2.arcLength(largest_contour, True)
                 approx = cv2.approxPolyDP(largest_contour, epsilon, True)
                 if len(approx) == 4:
@@ -248,15 +284,22 @@ class PDFPreprocessor:
                     break
         
         if len(approx) != 4:
-            # If still not 4 points, use bounding box as fallback
-            logger.warning(f"      ⚠ Could not approximate to 4 corners (got {len(approx)}), using bounding box")
-            x, y, w, h = cv2.boundingRect(largest_contour)
-            approx = np.array([
-                [[x, y]],
-                [[x + w, y]],
-                [[x + w, y + h]],
-                [[x, y + h]]
-            ], dtype=np.int32)
+            # If still not 4 points, use convex hull approach
+            logger.info(f"      Trying convex hull approach...")
+            hull = cv2.convexHull(largest_contour)
+            epsilon = 0.02 * cv2.arcLength(hull, True)
+            approx = cv2.approxPolyDP(hull, epsilon, True)
+            
+            if len(approx) != 4:
+                # Last resort: use bounding box
+                logger.warning(f"      ⚠ Could not approximate to 4 corners (got {len(approx)}), using bounding box")
+                x, y, w, h = cv2.boundingRect(largest_contour)
+                approx = np.array([
+                    [[x, y]],
+                    [[x + w, y]],
+                    [[x + w, y + h]],
+                    [[x, y + h]]
+                ], dtype=np.int32)
         
         logger.info(f"      ✓ Detected page contour with 4 corners")
         return approx
